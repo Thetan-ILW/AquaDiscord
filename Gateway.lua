@@ -9,17 +9,19 @@ local LsTcpSocket = require("aqua.web.luasocket.LsTcpSocket")
 local copas = require("copas")
 local socket = require("socket")
 local socket_url = require("socket.url")
-local json = require("cjson")
+local json = require("web.json")
 
 local Opcode = require("discord.GatewayOpcode")
 
 ---@alias discord.Gateway.State
 ---| "not_authorized"
 ---| "ready"
+---| "reconnect"
 
 ---@class discord.Gateway
 ---@overload fun(bot_token: string, intents: discord.Gateway.Intents): discord.Gateway
 ---@field state discord.Gateway.State
+---@field gatewayUrl string?
 ---@field resumeGatewayUrl string?
 ---@field sessionId integer?
 ---@field sequence integer? Last sequence number from `d` field in payloads
@@ -42,6 +44,7 @@ local Gateway = class()
 ---@field shards integer Recommended number of shards to use when connecting
 ---@field session_start_limit discord.Gateway.GatewayMetadata.SessionStartLimit
 
+Gateway.urlParams = "/?v=10&encoding=json"
 Gateway.sslParams = {
 	wrap = {
 		mode = "client",
@@ -81,7 +84,11 @@ function Gateway:getGatewayMetadata()
 	req:send("")
 
 	local text = res:receive("*a")
-	local decoded = json.decode(text)
+	local decoded, err = json.decode_safe(text)
+
+	if err then
+		return nil, "Got corrupted JSON while fetching gateway metadata"
+	end
 
 	if decoded.url then
 		return decoded, nil
@@ -91,7 +98,6 @@ function Gateway:getGatewayMetadata()
 end
 
 ---@private
----@return web.Websocket
 function Gateway:connect(host, port)
 	local sock = copas.wrap(socket.tcp(), self.sslParams)
 	copas.setsocketname("my_TCP_client", sock)
@@ -114,33 +120,30 @@ function Gateway:connect(host, port)
 	req.headers:set("Host", parsed_url.host)
 	local res = Response(sock)
 
-	return Websocket(sock, req, res, "client")
+	self.ws = Websocket(sock, req, res, "client")
+
+	function self.ws.protocol.text(_, payload)
+		self:handleEvent(payload)
+	end
+
+	assert(self.ws:handshake())
+	assert(self.ws:loop())
+	print("Loop stopped")
 end
 
 -- Connects to the server and starts copas threads
 function Gateway:start()
+	local metadata, err = self:getGatewayMetadata()
+
+	if not metadata then
+		print(err)
+		return
+	end
+
+	self.gatewayUrl = metadata.url
+
 	copas.addthread(function ()
-		local metadata, err = self:getGatewayMetadata()
-
-		if not metadata then
-			print(err)
-			return
-		end
-
-		self.ws = self:connect(
-			metadata.url .. "/?v=10&encoding=json",
-			443
-		)
-
-		function self.ws.protocol.text(_, payload)
-			print(payload)
-			self:handleEvent(json.decode(payload))
-		end
-
-		assert(self.ws:handshake())
-		assert(self.ws:loop())
-		print("Loop stopped")
-		self:stop()
+		self:connect(self.gatewayUrl .. self.urlParams, 443)
 	end)
 
 	copas.addthread(function ()
@@ -158,8 +161,15 @@ function Gateway:start()
 	print("Threads stopped")
 end
 
-function Gateway:stop()
+function Gateway:disconnect()
+	self.heartbeats = 0
+	self.heartbeatAcks = 0
+	self.nextHeartbeatTime = math.huge
 	self.ws:send_close()
+end
+
+function Gateway:stop()
+	self:disconnect()
 	copas.exit()
 end
 
@@ -173,10 +183,29 @@ function Gateway:send(opcode, data)
 	self.ws:send("text", json.encode(t))
 end
 
----@param event discord.Gateway.Payload
+---@param payload string
 ---@private
-function Gateway:handleEvent(event)
+function Gateway:handleEvent(payload)
+	local event, error = json.decode_safe(payload)
+
+	if error then
+		print(error)
+		return
+	end
+
+	---@cast event discord.Gateway.Payload
 	local op = event.op
+	print(payload)
+
+	if  op == Opcode.UnknownOpcode or
+		op == Opcode.DecodeError or
+		op == Opcode.AlreadyAuthenticated or
+		op == Opcode.RateLimited or
+		op == Opcode.NotAuthenticated then
+		print(("Oopsie woopsie. Closing the connection. Opcode: %i | State: %s"):format(op, self.state))
+		self:stop()
+		return
+	end
 
 	if self.state == "not_authorized" then
 		if op == Opcode.Hello then
@@ -203,12 +232,51 @@ function Gateway:handleEvent(event)
 			self.state = "ready"
 			self.resumeGatewayUrl = event.d.resume_gateway_url
 			self.sessionId = event.d.session_id
+		elseif op == Opcode.SessionTimedOut then
+			self:disconnect()
+			self:connect(self.gatewayUrl .. self.urlParams, 443)
+		elseif  op == Opcode.InvalidShard or
+				op == Opcode.ShardingRequired or
+				op == Opcode.InvalidApiVersion or
+				op == Opcode.InvalidIntents or
+				op == Opcode.DisallowedIntents then
+			print(("YOU did something wrong. Opcode: %i"):format(op))
+			self:stop()
 		else
 			print(("[%s][%i] Unknown opcode"):format(self.state, op))
 		end
 	elseif self.state == "ready" then
 		if op == Opcode.HeartbeatAck then
 			self.heartbeatAcks = self.heartbeatAcks + 1
+		elseif op == Opcode.Hello then
+			self.nextHeartbeatTime = 0
+		elseif op == Opcode.Dispatch then
+			self.sequence = event.s
+		elseif  op == Opcode.Reconnect or
+				op == Opcode.SessionTimedOut then
+			self.state = "reconnect"
+			self:disconnect()
+			self:connect(self.resumeGatewayUrl .. self.urlParams, 443)
+			self:send(Opcode.Resume, {
+				token = self.botToken,
+				session_id = self.sessionId,
+				seq = self.sequence
+			})
+		else
+			print(("[%s][%i] Unknown opcode"):format(self.state, op))
+		end
+	elseif self.state == "reconnect" then
+		if op == Opcode.InvalidSession then
+			if event.d == false then
+				self:disconnect()
+				self.state = "not_authorized"
+				self:connect(self.gatewayUrl .. self.urlParams, 443)
+			end
+		elseif op == Opcode.Dispatch then
+			self.state = "ready"
+			self:handleEvent(payload)
+		else
+			print(("[%s][%i] Unknown opcode"):format(self.state, op))
 		end
 	end
 end
